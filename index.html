@@ -249,9 +249,10 @@ function initGame(){
   ballsMoving=false; shotInProgress=false;
   cpuThinking=false; cpuThinkTimer=0; dsmPhase='idle';
   updateScoreboard();
-  msg('BREAK SHOT — YOUR TURN (PLAYER 1)',0);
-  document.getElementById('statusDisplay').textContent='BREAK SHOT';
-  resetShotPhase();
+  msg('PLACE CUE BALL — MOVE MOUSE UP/DOWN · CLICK TO PLACE',0);
+  document.getElementById('statusDisplay').textContent='PLACE CUE BALL';
+  shotPhase='placing';
+  currentPower=0; powerDragStart=null; aimJustLocked=false;
   // Welcome applause
   setTimeout(()=>playAplausos(), 400);
 }
@@ -260,6 +261,7 @@ function initGame(){
 // Near-miss tracking: did the cue ball pass very close to a pocket
 // with a target ball nearby (ball rattled in the jaws but didn't drop)?
 let nearMissDetected = false;
+let _nearMissFired = new Set(); // ball-pocket pairs already triggered this shot
 
 function stepPhysics(){
   // Move balls
@@ -305,14 +307,39 @@ function stepPhysics(){
     }
   }
 
+  // Near-miss detection — runs BEFORE pocket detection so we can see
+  // which balls are still active. Only fires if ball is clearly outside
+  // the drop zone (dist >= POCKET_R*1.15 ensures no overlap with pocket).
+  if(shotInProgress){
+    balls.forEach(b=>{
+      if(!b.active||b.isCue) return;
+      const spd=Math.sqrt(b.vx*b.vx+b.vy*b.vy);
+      if(spd < 0.4) return;
+      POCKETS.forEach((p,pi)=>{
+        const dx=b.x-p.x, dy=b.y-p.y;
+        const dist=Math.sqrt(dx*dx+dy*dy);
+        if(dist < POCKET_R*1.65 && dist >= POCKET_R*1.15){
+          const key=`${b.id}-${pi}`;
+          if(!_nearMissFired.has(key)){
+            _nearMissFired.add(key);
+            nearMissDetected=true;
+            playWow();
+          }
+        }
+      });
+    });
+  }
+
   // Pocket detection
   balls.forEach(b=>{
     if(!b.active) return;
-    POCKETS.forEach(p=>{
+    POCKETS.forEach((p,pi)=>{
       const dx=b.x-p.x, dy=b.y-p.y;
       if(Math.sqrt(dx*dx+dy*dy)<POCKET_R+2){
         b.active=false; b.pocketed=true;
         b.vx=0; b.vy=0;
+        // Cancel any pending wow for this ball-pocket — it went in
+        _nearMissFired.add(`${b.id}-${pi}`);
         playPocket();
         if(b.isCue) cuePottedThisTurn=true;
         else {
@@ -320,10 +347,8 @@ function stepPhysics(){
           pottedThisTurn.push(b);
           if(b.isEight) eightPottedBy=turn;
           else if(b.scoreValue>0){
-            // Credit score to whoever potted this ball
             if(turn===1) p1score+=b.scoreValue;
             else p2score+=b.scoreValue;
-            // Update display immediately
             document.getElementById(turn===1?'p1score':'p2score').textContent=
               '$'+(turn===1?p1score:p2score).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
           }
@@ -331,21 +356,6 @@ function stepPhysics(){
       }
     });
   });
-
-  // Near-miss detection: any active non-cue ball within 1.6× pocket radius
-  // but NOT pocketed = rattled the jaws
-  if(shotInProgress){
-    balls.forEach(b=>{
-      if(!b.active||b.isCue) return;
-      POCKETS.forEach(p=>{
-        const dx=b.x-p.x, dy=b.y-p.y;
-        const dist=Math.sqrt(dx*dx+dy*dy);
-        if(dist < POCKET_R*1.6 && dist >= POCKET_R+2){
-          nearMissDetected=true;
-        }
-      });
-    });
-  }
 
   // Check if all stopped
   ballsMoving=balls.some(b=>b.active&&(Math.abs(b.vx)>MIN_SPEED||Math.abs(b.vy)>MIN_SPEED));
@@ -564,6 +574,7 @@ function executeDsmFire(){
   cueBall.vx=nx*dsmLaunchSpeed; cueBall.vy=ny*dsmLaunchSpeed;
   playStrike(Math.min(1, (dsmLaunchSpeed-3)/14));
   nearMissDetected=false;
+  _nearMissFired=new Set();
   shotInProgress=true; ballsMoving=true;
   shotPhase='idle'; currentPower=0; powerDragStart=null; dsmPhase='idle';
   pottedThisTurn=[]; cuePottedThisTurn=false; eightPottedBy=null;
@@ -625,11 +636,9 @@ function handleTurnEnd(){
 
   if(pottedThisTurn.length>0&&!continueTurn){
     msg(`WRONG BALL — ${whoOpp}'S TURN`);
-    if(nearMissDetected) playWow();
     switchTurn();
   } else if(!continueTurn){
     msg(`MISS — ${whoOpp}'S TURN`);
-    if(nearMissDetected) playWow();
     switchTurn();
   } else {
     msg(`NICE POT! ${whoMe} CONTINUES`);
@@ -881,6 +890,13 @@ function resetShotPhase(){
 canvas.addEventListener('mousedown',e=>{
   unlockAudio();
   if(turn===2||gamePhase!=='playing'||ballsMoving||shotInProgress) return;
+  if(shotPhase==='placing'){
+    // Lock cue ball at current Y position then go to aim
+    shotPhase='aim';
+    msg('STEP 1 · MOVE MOUSE TO AIM · CLICK TO LOCK DIRECTION',0);
+    document.getElementById('statusDisplay').textContent='BREAK SHOT';
+    return;
+  }
   if(shotPhase==='aim'){
     const dx=mouse.x-cueBall.x, dy=mouse.y-cueBall.y;
     aimAngle=Math.atan2(dy,dx);
@@ -895,6 +911,12 @@ canvas.addEventListener('mousedown',e=>{
 });
 canvas.addEventListener('mousemove',e=>{
   mouse=getCanvasPos(e);
+  // During placing: cue ball follows mouse Y, constrained to left quarter
+  if(shotPhase==='placing'&&turn===1){
+    const placingX = TL + TW*0.25;
+    const placingY = Math.max(TT+BALL_R+4, Math.min(TB-BALL_R-4, mouse.y));
+    cueBall.x=placingX; cueBall.y=placingY;
+  }
   if(shotPhase==='power'&&powerDragStart&&turn===1){
     const nx=Math.cos(aimAngle), ny=Math.sin(aimAngle);
     const ddx=mouse.x-powerDragStart.x, ddy=mouse.y-powerDragStart.y;
@@ -910,6 +932,12 @@ canvas.addEventListener('touchstart',e=>{
   e.preventDefault(); unlockAudio();
   if(turn===2||gamePhase!=='playing'||ballsMoving||shotInProgress) return;
   const pos=getCanvasPos(e);
+  if(shotPhase==='placing'){
+    shotPhase='aim';
+    msg('STEP 1 · MOVE MOUSE TO AIM · CLICK TO LOCK DIRECTION',0);
+    document.getElementById('statusDisplay').textContent='BREAK SHOT';
+    return;
+  }
   if(shotPhase==='aim'){
     const dx=pos.x-cueBall.x, dy=pos.y-cueBall.y;
     aimAngle=Math.atan2(dy,dx);
@@ -924,6 +952,11 @@ canvas.addEventListener('touchstart',e=>{
 },{passive:false});
 canvas.addEventListener('touchmove',e=>{
   e.preventDefault(); mouse=getCanvasPos(e);
+  if(shotPhase==='placing'&&turn===1){
+    const placingX = TL + TW*0.25;
+    const placingY = Math.max(TT+BALL_R+4, Math.min(TB-BALL_R-4, mouse.y));
+    cueBall.x=placingX; cueBall.y=placingY;
+  }
   if(shotPhase==='power'&&powerDragStart&&turn===1){
     const nx=Math.cos(aimAngle), ny=Math.sin(aimAngle);
     const ddx=mouse.x-powerDragStart.x, ddy=mouse.y-powerDragStart.y;
@@ -957,6 +990,7 @@ function fireShot(power){
   cueBall.vx=nx*(3+power*14); cueBall.vy=ny*(3+power*14);
   playStrike(power);
   nearMissDetected=false;
+  _nearMissFired=new Set();
   shotInProgress=true; ballsMoving=true;
   shotPhase='idle'; currentPower=0; powerDragStart=null;
   dsmPhase='idle';
@@ -1166,6 +1200,27 @@ function drawAimLine(){
   }
 
   // ── Player cue ───────────────────────────────────────────────
+  if(shotPhase==='placing'){
+    const cx=cueBall.x, cy=cueBall.y;
+    const pulse=1+0.08*Math.sin(Date.now()*0.006);
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx,cy,(BALL_R+8)*pulse,0,Math.PI*2);
+    ctx.strokeStyle='rgba(255,255,100,0.55)'; ctx.lineWidth=2; ctx.stroke();
+    ctx.fillStyle='rgba(255,255,100,0.85)';
+    ctx.font='bold 15px "Share Tech Mono",monospace';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText('▲', cx, cy-BALL_R-18);
+    ctx.fillText('▼', cx, cy+BALL_R+18);
+    ctx.font='bold 10px "Share Tech Mono",monospace';
+    ctx.fillText('MOVE UP/DOWN · CLICK TO PLACE', cx, cy-BALL_R-32);
+    ctx.setLineDash([3,5]);
+    ctx.strokeStyle='rgba(255,255,100,0.2)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(cx,TT+4); ctx.lineTo(cx,TB-4); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+    return;
+  }
+
   if(shotPhase==='aim'){
     const dx=mouse.x-cueBall.x, dy=mouse.y-cueBall.y;
     const len=Math.sqrt(dx*dx+dy*dy)||1;
@@ -1319,7 +1374,9 @@ function drawTurnBanner(){
   let text, col;
   const isYou=turn===1;
   if(isYou){
-    text = shotPhase==='power' ? '● AIM LOCKED · SET POWER' : '▶ YOUR TURN · STEP 1: AIM';
+    text = shotPhase==='placing' ? '▶ PLACE CUE BALL · CLICK TO SET'
+         : shotPhase==='power'   ? '● AIM LOCKED · SET POWER'
+         : '▶ YOUR TURN · STEP 1: AIM';
     col  = shotPhase==='power' ? '#4ade80' : '#ffff00';
   } else {
     text = cpuThinking        ? '⧖ DSM THINKING...'
