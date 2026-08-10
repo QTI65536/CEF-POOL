@@ -389,8 +389,8 @@ function stepPhysics(){
   });
 
   // Near-miss detection — runs AFTER pocket detection.
-  // Skips any ball pocketed this frame, and requires ball to be
-  // clearly outside the drop zone (>= POCKET_R*1.3) to avoid overlap.
+  // Only fires when ball is MOVING AWAY from the pocket (already passed it),
+  // so it can never overlap with a ball that's still approaching and about to pocket.
   if(shotInProgress){
     balls.forEach(b=>{
       if(!b.active||b.isCue||pocketedThisFrame.has(b.id)) return;
@@ -400,11 +400,16 @@ function stepPhysics(){
         const dx=b.x-p.x, dy=b.y-p.y;
         const dist=Math.sqrt(dx*dx+dy*dy);
         if(dist < POCKET_R*1.65 && dist >= POCKET_R*1.3){
+          // Dot product of velocity with pocket direction:
+          // positive = moving TOWARD pocket (still approaching — skip, may still pot)
+          // negative = moving AWAY from pocket (already passed — safe to wow)
+          const dot=b.vx*dx+b.vy*dy; // v · (ball→pocket reversed) — positive means leaving
+          if(dot <= 0) return; // still heading toward pocket, don't trigger
           const key=`${b.id}-${pi}`;
           if(!_nearMissFired.has(key)){
             _nearMissFired.add(key);
             nearMissDetected=true;
-            playWow();
+            if(!practiceMode) playWow(); // rotates through wow/baby/damn/aww/laughter
           }
         }
       });
@@ -460,7 +465,8 @@ function executeCpuShot(){
   if(targets.length===0) return;
 
   // ── Path obstruction check ───────────────────────────────────
-  // Uses BALL_R*2 clearance (cue ball diameter must pass)
+  // Cue must not pass through opponent balls, the 8-ball (unless clearing),
+  // or any other active ball except the intended target.
   function pathClear(x1,y1,x2,y2,excludeId){
     const dx=x2-x1,dy=y2-y1,len=Math.sqrt(dx*dx+dy*dy)||1;
     const nx=dx/len,ny=dy/len;
@@ -653,19 +659,18 @@ function executeCpuShot(){
   }
 
   // TRICK 3: Combination shot — cue hits Ball A which knocks Ball B into pocket
+  // Both bA and bB must be DSM's own balls (no opponent balls, no 8-ball)
   function evalCombo(){
     let bestTrick=null, bestTS=Infinity;
-    const allActive=balls.filter(b=>b.active&&!b.isCue);
-    for(const bA of targets){
-      for(const bB of allActive){
+    // Only use own balls as both primary and secondary targets
+    const ownBalls=targets; // already filtered to myType
+    for(const bA of ownBalls){
+      for(const bB of ownBalls){
         if(bB.id===bA.id) continue;
         for(const pk of POCKETS){
-          // bB must be pottable into pk
           const bdx=pk.x-bB.x, bdy=pk.y-bB.y, blen=Math.sqrt(bdx*bdx+bdy*bdy)||1;
           if(!pathClear(bB.x,bB.y,pk.x,pk.y,-1)) continue;
-          // Ghost for bA→bB collision
           const ghostBx=bB.x-bdx/blen*BALL_R*2, ghostBy=bB.y-bdy/blen*BALL_R*2;
-          // Direction cue must push bA to hit ghostB
           const adx=ghostBx-bA.x, ady=ghostBy-bA.y, alen=Math.sqrt(adx*adx+ady*ady)||1;
           const ghostAx=bA.x-adx/alen*BALL_R*2, ghostAy=bA.y-ady/alen*BALL_R*2;
           const cdx=ghostAx-cueBall.x, cdy=ghostAy-cueBall.y;
@@ -673,7 +678,7 @@ function executeCpuShot(){
           if(!pathClear(cueBall.x,cueBall.y,ghostAx,ghostAy,bA.id)) continue;
           if(!pathClear(bA.x,bA.y,ghostBx,ghostBy,bB.id)) continue;
           const totalLen=clen+alen+blen;
-          const score=totalLen*0.6+100; // +100 handicap — combos are flashy but hard
+          const score=totalLen*0.6+100;
           if(score<bestTS){ bestTS=score; bestTrick={tb:bA,pk,ghostX:ghostAx,ghostY:ghostAy,
             clen,tlen:alen+blen,trick:'combo',score}; }
         }
@@ -723,33 +728,29 @@ function executeCpuShot(){
   }
 
   function simSpeedAfterDist(v0, dist){
-    // Simulate cue ball decelerating frame by frame over dist pixels.
-    // Returns speed when cumulative distance first reaches dist.
     let v = v0, d = 0;
     while(v > MIN_SPEED){
       d += v;
-      if(d >= dist) return v * FRICTION; // speed just after crossing dist
+      if(d >= dist) return v; // speed AT crossing point (not post-FRICTION)
       v *= FRICTION;
     }
-    return 0; // ball stopped before reaching dist
+    return 0;
   }
 
-  // Required speed for target ball to reach pocket (with margin)
-  const vTarget = speedForDist(best.tlen) * 1.12;
+  // Required speed for target ball to reach pocket (with generous margin)
+  const vTarget = speedForDist(best.tlen) * 1.3 / 0.92; // account for restitution loss
 
-  // Binary search: find minimum launch speed so cue arrives at ghost
-  // with at least vTarget. Lower bound must be >= vTarget (cue needs
-  // at least that speed even with zero friction loss), upper bound
-  // is max possible shot speed.
-  let lo = vTarget, hi = 17.0;
-  // Ensure lo is achievable — if clen>0 we need extra to overcome friction
+  // Binary search for launch speed
+  let lo = vTarget, hi = 20.0; // cap at 20 (allows long cross-table shots)
   lo = Math.max(vTarget, speedForDist(best.clen) + vTarget);
-  for(let i = 0; i < 50; i++){
+  if(lo >= hi) lo = hi * 0.5; // safety: if lo>hi flip to avoid bad search
+  for(let i = 0; i < 60; i++){
     const mid = (lo + hi) / 2;
     if(simSpeedAfterDist(mid, best.clen) >= vTarget) hi = mid;
     else lo = mid;
   }
-  const launchSpeed = Math.min(17, hi * 1.08); // 8% margin, cap at max
+  // Add 15% margin; enforce a minimum of 3 px/frame so shots always have visible energy
+  const launchSpeed = Math.max(3.5, Math.min(20, hi * 1.15));
 
   // Perfect aim — use trick shot's pre-computed angle if available
   const aimDx=best.ghostX-cueBall.x, aimDy=best.ghostY-cueBall.y;
@@ -807,12 +808,13 @@ function handleTurnEnd(){
     return;
   }
 
-  // Scratch
+  // Scratch — suppress haha if balls were also pocketed (applause already played)
   if(cuePottedThisTurn){
     cueBall.active=true; cueBall.pocketed=false;
     cueBall.x=TL+TW*0.25; cueBall.y=TT+TH/2;
     cueBall.vx=0; cueBall.vy=0;
     msg(`SCRATCH! BALL IN HAND — ${whoOpp}'S TURN`);
+    if(pottedThisTurn.length===0)(Math.random()<0.5?playHaha:playLaughter)();
     switchTurn();
     pottedThisTurn=[]; cuePottedThisTurn=false; eightPottedBy=null;
     updateScoreboard();
@@ -834,16 +836,23 @@ function handleTurnEnd(){
   }
 
   const myType=turn===1?p1type:p2type;
+  const oppType=myType==='solid'?'stripe':'solid';
+
+  // Check if any opponent balls or 8-ball were illegally pocketed — always a foul
+  const illegalPot = pottedThisTurn.some(b=>
+    b.isEight||(myType!==null&&((oppType==='solid'&&b.isSolid)||(oppType==='stripe'&&b.isStripe)))
+  );
+
   const potCorrect=pottedThisTurn.filter(b=>
     myType===null||(myType==='solid'&&b.isSolid)||(myType==='stripe'&&b.isStripe)
   );
-  const continueTurn=pottedThisTurn.length>0&&potCorrect.length>0&&pottedThisTurn.every(b=>
+  // continueTurn: must have pocketed own balls, no illegal balls, no wrong balls
+  const continueTurn=!illegalPot&&pottedThisTurn.length>0&&potCorrect.length>0&&pottedThisTurn.every(b=>
     (myType===null)||b.isSolid&&myType==='solid'||b.isStripe&&myType==='stripe'
   );
 
   if(pottedThisTurn.length>0&&!continueTurn){
     msg(`WRONG BALL — ${whoOpp}'S TURN`);
-    (Math.random()<0.5?playHaha:playLaughter)();
     switchTurn();
   } else if(!continueTurn){
     msg(`MISS — ${whoOpp}'S TURN`);
@@ -1051,10 +1060,11 @@ function playAplausos(){
 
 let _wowToggle = 0;
 const _wowClips = [
-  ['wow',  WOW_B64,  1.0],
-  ['baby', BABY_B64, 1.0],
-  ['damn', DAMN_B64, 1.0],
-  ['aww',  AWW_B64,  1.0],
+  ['wow',     WOW_B64,      1.0],
+  ['baby',    BABY_B64,     1.0],
+  ['damn',    DAMN_B64,     1.0],
+  ['aww',     AWW_B64,      1.0],
+  ['laughter',LAUGHTER_B64, 1.0],
 ];
 function playWow(){
   const ac=getAC(); if(!ac||!audioUnlocked) return;
@@ -1945,7 +1955,7 @@ function checkTrickSuccess(){
     } else {
       msg(`${pocketed}/${def.successIds.length} pocketed · ${remaining} left — keep going!`,0);
       document.getElementById('statusDisplay').textContent='NOT QUITE';
-      if(pocketed===0) playWow();
+      if(pocketed===0 && !practiceMode) playWow();
     }
     updateTrickScoreboard();
     // Restore cue ball if scratched so player can keep shooting
